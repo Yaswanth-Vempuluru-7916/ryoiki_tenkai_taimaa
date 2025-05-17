@@ -55,6 +55,14 @@ async fn add_domains(
        println!("Domain Added");
        Ok((StatusCode::CREATED, Json(payload)))
 }
+async fn get_domains(State(state):State<AppState>)->Json<Vec<Domain>>{
+    let domains = state.domains.lock().expect("Mutex Poisoned");
+    let domains_vec = domains.values().cloned().collect();
+    //why cloned ??
+    //.collect() -> consumes an iterator and  transforms it into a collection, like a Vec, HashMap, HashSet, etc.
+    println!("Returning domains: {:?}", domains_vec);
+    Json(domains_vec)
+}
 #[tokio::main]
 async fn main() {
     let config = Config::from_env();
@@ -63,6 +71,7 @@ async fn main() {
     };
     let app = Router::new()
         .route("/domains",post(add_domains))
+        .route("/domains/active", get(get_domains))
         .route("/health",get(check_health))
         .with_state(state);
     let addr : SocketAddr = format!("{}:{}",config.host,config.port)
