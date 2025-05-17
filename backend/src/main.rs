@@ -1,10 +1,6 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::{post,get},
-    Json, 
-    Router};
+    extract::State, http::{StatusCode}, response::{IntoResponse, Response}, routing::{get, post}, Json, Router};
 use config::Config;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -26,6 +22,17 @@ struct HealthResponse {
     status: String,
 }
 
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+impl IntoResponse for ErrorResponse{
+    fn into_response(self)->Response{
+        (StatusCode::CONFLICT,Json(self)).into_response()
+    }
+}
+
 async fn check_health() -> axum::Json<HealthResponse> {
     let health_status = String::from("I am healthier than you BROther");
     axum::Json(HealthResponse {
@@ -33,20 +40,20 @@ async fn check_health() -> axum::Json<HealthResponse> {
     })
 }
 
-async fn add_domains( state : State<AppState>,
-    Json(payload) : Json<Domain>
+async fn add_domains( 
+    State(state) : State<AppState>,
+    Json(payload) : Json<Domain>,
    )
-    ->Result<(StatusCode,Json<Domain>),StatusCode>{
-        let domain = payload;
-        println!("Adding domain: {:?}", domain);
-       let  mut domains = state.domains.lock().unwrap();
-       if domains.contains_key(&domain.id){
-        println!("Domain Already Exists");
-        return Err(StatusCode::CONFLICT);
-       }
-       domains.insert(domain.id,domain.clone());
+    ->Result<(StatusCode, Json<Domain>), ErrorResponse>{
+        let  mut domains = state.domains.lock().expect("Mutex Poisoned");
+        if domains.contains_key(&payload.id){
+            println!("Domain Already Exists");
+            return Err(ErrorResponse { error: "Domain already exists".to_string() });
+        }
+       println!("Adding domain: {:?}", payload);
+       domains.insert(payload.id,payload.clone());
        println!("Domain Added");
-       Ok((StatusCode::CREATED, Json(domain)))
+       Ok((StatusCode::CREATED, Json(payload)))
 }
 #[tokio::main]
 async fn main() {
