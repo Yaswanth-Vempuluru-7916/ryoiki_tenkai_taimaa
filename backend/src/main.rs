@@ -1,20 +1,30 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}};
 use axum::{
-    extract::State, http::{StatusCode}, response::{IntoResponse, Response}, routing::{get, post}, Json, Router};
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use config::Config;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{task, time::interval};
 mod config;
 
-#[derive(Serialize,Deserialize,Clone,Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct Domain {
-    id : i32,
-    name : String,
-    duration : i32
+    id: i32,
+    name: String,
+    duration: i32,
 }
 #[derive(Clone)]
-struct AppState{
-    domains : Arc<Mutex<HashMap<i32,Domain>>>,
+struct AppState {
+    domains: Arc<Mutex<HashMap<i32, (Domain, Instant)>>>,
 }
 
 #[derive(Serialize)]
@@ -27,9 +37,9 @@ struct ErrorResponse {
     error: String,
 }
 
-impl IntoResponse for ErrorResponse{
-    fn into_response(self)->Response{
-        (StatusCode::CONFLICT,Json(self)).into_response()
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> Response {
+        (StatusCode::CONFLICT, Json(self)).into_response()
     }
 }
 
@@ -40,44 +50,88 @@ async fn check_health() -> axum::Json<HealthResponse> {
     })
 }
 
-async fn add_domains( 
-    State(state) : State<AppState>,
-    Json(payload) : Json<Domain>,
-   )
-    ->Result<(StatusCode, Json<Domain>), ErrorResponse>{
-        let  mut domains = state.domains.lock().expect("Mutex Poisoned");
-        if domains.contains_key(&payload.id){
-            println!("Domain Already Exists");
-            return Err(ErrorResponse { error: "Domain already exists".to_string() });
-        }
-       println!("Adding domain: {:?}", payload);
-       domains.insert(payload.id,payload.clone());
-       println!("Domain Added");
-       Ok((StatusCode::CREATED, Json(payload)))
+async fn add_domains(
+    State(state): State<AppState>,
+    Json(payload): Json<Domain>,
+) -> Result<(StatusCode, Json<Domain>), ErrorResponse> {
+    let mut domains = state.domains.lock().expect("Mutex Poisoned");
+    if domains.contains_key(&payload.id) {
+        println!("Domain Already Exists");
+        return Err(ErrorResponse {
+            error: "Domain already exists".to_string(),
+        });
+    }
+    println!("Adding domain: {:?}", payload);
+    domains.insert(payload.id, (payload.clone(), Instant::now()));
+    println!("Domain Added");
+    Ok((StatusCode::CREATED, Json(payload)))
 }
-async fn get_domains(State(state):State<AppState>)->Json<Vec<Domain>>{
+
+async fn get_domains(State(state): State<AppState>) -> Json<Vec<Domain>> {
     let domains = state.domains.lock().expect("Mutex Poisoned");
-    let domains_vec = domains.values().cloned().collect();
-    //why cloned ??
-    //.collect() -> consumes an iterator and  transforms it into a collection, like a Vec, HashMap, HashSet, etc.
-    println!("Returning domains: {:?}", domains_vec);
-    Json(domains_vec)
+    let now = Instant::now();
+
+    let active_domains = domains
+        .iter()
+        .filter_map(|(_key, (domain, instant))| {
+            let elapsed = now.duration_since(*instant).as_secs();
+            if elapsed < domain.duration as u64 {
+                Some(domain.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    println!("Returning domains: {:?}", active_domains);
+    Json(active_domains)
+}
+
+async fn cleanup_expired_domains(domains: Arc<Mutex<HashMap<i32, (Domain, Instant)>>>) {
+    let mut interval = interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let mut domains = domains.lock().expect("Mutex Poisoned");
+        let before = domains.len();
+        let now = Instant::now();
+
+        domains.retain(|_id, (domain, instant)| {
+            let elapsed = now.duration_since(*instant).as_secs();
+            elapsed < domain.duration as u64
+        });
+        let after = domains.len();
+        println!("Cleanup ran. Removed {} expired domain(s).", before - after);
+    }
 }
 #[tokio::main]
 async fn main() {
+
     let config = Config::from_env();
-    let state = AppState{
-        domains : Arc::new(Mutex::new(HashMap::new()))
+    let state = AppState {
+        domains: Arc::new(Mutex::new(HashMap::new())),
     };
+    
+    let domains = state.domains.clone();
+
     let app = Router::new()
-        .route("/domains",post(add_domains))
+        .route("/domains", post(add_domains))
         .route("/domains/active", get(get_domains))
-        .route("/health",get(check_health))
+        .route("/health", get(check_health))
         .with_state(state);
-    let addr : SocketAddr = format!("{}:{}",config.host,config.port)
+
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .expect("Invalid address");
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind address");
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind address");
+
     println!("Server running on http://{addr}");
-    axum::serve(listener, app).await.unwrap();
+
+    task::spawn(cleanup_expired_domains(domains.clone()));
+
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start the server");
+
 }
