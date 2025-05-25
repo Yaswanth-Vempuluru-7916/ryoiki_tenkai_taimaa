@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -16,6 +16,13 @@ use std::{
 use tokio::{task, time::interval};
 mod config;
 
+#[derive(Debug)]
+enum AppError {
+    NotFound(String),
+    Internal(String),
+    Conflict(String),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Domain {
     id: i32,
@@ -23,7 +30,15 @@ struct Domain {
     duration: i32,
 }
 
-#[derive(Clone)]
+#[derive(Debug,Serialize,Deserialize)]
+struct DomainStatus{
+    id : i32,
+    name : String,
+    duration : i32,
+    remaining_seconds : u64
+}
+
+#[derive(Clone,Debug)]
 struct AppState {
     domains: Arc<Mutex<HashMap<i32, (Domain, Instant)>>>,
 }
@@ -33,43 +48,41 @@ struct HealthResponse {
     status: String,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
 
-impl IntoResponse for ErrorResponse {
+impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (StatusCode::CONFLICT, Json(self)).into_response()
+        let (status,message) = match self {
+            AppError::Internal(msg)=>(StatusCode::INTERNAL_SERVER_ERROR,msg),
+            AppError::NotFound(msg)=>(StatusCode::NOT_FOUND,msg),
+            AppError::Conflict(msg)=>(StatusCode::CONFLICT,msg)
+        };
+         let body = Json(serde_json::json!({"error":message}));
+         (status,body).into_response()
     }
 }
 
-async fn check_health() -> axum::Json<HealthResponse> {
-    let health_status = String::from("I am healthier than you BROther");
-    axum::Json(HealthResponse {
-        status: health_status,
-    })
+async fn check_health() -> Json<HealthResponse> {
+   Json(HealthResponse{
+    status :  "I am healthier than you BROther".to_string(),
+   })
 }
 
 async fn add_domains(
     State(state): State<AppState>,
     Json(payload): Json<Domain>,
-) -> Result<(StatusCode, Json<Domain>), ErrorResponse> {
-    let mut domains = state.domains.lock().expect("Mutex poisoned");
+) -> Result<(StatusCode, Json<Domain>), AppError> {
+    let mut domains = state.domains.lock().map_err(|_| AppError::Internal("Mutex Poisoned".into()))?;
     println!("Adding domain: {:?}", payload);
     if domains.contains_key(&payload.id) {
-        println!("Domain already exists");
-        return Err(ErrorResponse {
-            error: "Domain already exists".to_string(),
-        });
+        return Err(AppError::Conflict("Domain already exists".to_string()));
     }
     domains.insert(payload.id, (payload.clone(), Instant::now()));
     println!("Domain added");
     Ok((StatusCode::CREATED, Json(payload)))
 }
 
-async fn get_domains(State(state): State<AppState>) -> Json<Vec<Domain>> {
-    let domains = state.domains.lock().expect("Mutex poisoned");
+async fn get_domains(State(state): State<AppState>) ->Result<Json<Vec<Domain>>, AppError> {
+    let domains = state.domains.lock().map_err(|_| AppError::Internal("Mutex Poisoned".into()))?;
     let now = Instant::now();
 
     let active_domains = domains
@@ -83,14 +96,53 @@ async fn get_domains(State(state): State<AppState>) -> Json<Vec<Domain>> {
         })
         .collect();
     println!("Returning domains: {:?}", active_domains);
-    Json(active_domains)
+    Ok(Json(active_domains))
+}
+
+async fn get_domain(State(state): State<AppState>,Path(id):Path<i32>)->Result<(StatusCode, Json<DomainStatus>), AppError>{
+
+    let domains = state.domains.lock().map_err(|_| AppError::Internal("Mutex Poisoned".into()))?;
+
+    if let Some(( domain , instant)) = domains.get(&id){
+       let now = Instant::now();
+
+       if now.duration_since(*instant)>=Duration::from_secs(domain.duration as u64){
+        return Err(AppError::NotFound(format!("Domain ID {} expired", id)));
+       }
+        
+       let expires_at = *instant + Duration::from_secs(domain.duration as u64);
+       let remaining_duration = expires_at.saturating_duration_since(now);
+       
+      
+        let domain_status = DomainStatus{
+            id : domain.id,
+            name : domain.name.clone(),
+            duration : domain.duration,
+            remaining_seconds  : remaining_duration.as_secs()
+        };
+
+
+        Ok((StatusCode::OK,Json(domain_status)))
+       
+    }else{
+        Err(AppError::NotFound(format!("Domain ID {} not found",id)))
+    }
+   
+
+
 }
 
 async fn cleanup_expired_domains(domains: Arc<Mutex<HashMap<i32, (Domain, Instant)>>>) {
     let mut interval = interval(Duration::from_secs(1)); // Use 1s for testing, revert to 5s for production
     loop {
         interval.tick().await;
-        let mut domains = domains.lock().expect("Mutex poisoned");
+        let mut domains = match domains.lock().map_err(|_| AppError::Internal("Mutex Poisoned".into())) {
+            Ok(domains) => domains,
+            Err(e) => {
+                println!("Cleanup error: {:?}", e);
+                continue;
+            }
+        };
         let before = domains.len();
         let now = Instant::now();
 
@@ -119,6 +171,7 @@ async fn main() {
         .route("/domains", post(add_domains))
         .route("/domains/active", get(get_domains))
         .route("/health", get(check_health))
+        .route("/domains/{id}",get(get_domain))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
