@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-
+use serde_json::json;
 use crate::{
     errors::AppError,
     models::{Domain, DomainStatus, HealthResponse},
@@ -86,4 +86,17 @@ pub async fn get_domain(
     } else {
         Err(AppError::NotFound(format!("Domain ID {} not found", id)))
     }
+}
+
+pub async fn db_test(State(state): State<AppState>)->Result<Json<serde_json::Value>,AppError>{
+    sqlx::query!("SELECT 1 as one")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|err|{
+            println!("DB connection failed: {:?}", err);
+            AppError::Internal("Database connection failed".into())
+        })?;
+        Ok(Json(json!({
+        "status": "Database connection OK"
+    })))
 }
